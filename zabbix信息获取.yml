@@ -1,16 +1,12 @@
 app:
-  description: 使用 Zabbix CSV Exporter 插件导出可下载的主机和主机群组 CSV 文件
+  description: 不依赖 Plugin 或自定义 Tool，通过原生 Code 节点获取 Zabbix 数据并输出可复制 CSV
   icon: 📊
   icon_background: '#FFEAD5'
   icon_type: emoji
   mode: workflow
-  name: Zabbix 信息获取
+  name: Zabbix 信息获取（保守 CSV 复制版）
   use_icon_as_answer_icon: false
-dependencies:
-- current_identifier: null
-  type: package
-  value:
-    plugin_unique_identifier: wangrundong/zabbix_csv_exporter:0.0.1@ac89ca768f3c0b666de4feadf8836b2cefde9ff685c3e6b63f2bb56afde5d97c
+dependencies: []
 kind: app
 version: 0.6.0
 workflow:
@@ -18,30 +14,7 @@ workflow:
   environment_variables: []
   features:
     file_upload:
-      allowed_file_extensions: []
-      allowed_file_types: []
-      allowed_file_upload_methods:
-      - local_file
-      - remote_url
       enabled: false
-      fileUploadConfig:
-        attachment_image_file_size_limit: 2
-        audio_file_size_limit: 50
-        batch_count_limit: 5
-        file_size_limit: 15
-        file_upload_limit: 20
-        image_file_batch_limit: 10
-        image_file_size_limit: 10
-        single_chunk_attachment_limit: 10
-        video_file_size_limit: 100
-        workflow_file_upload_limit: 10
-      image:
-        enabled: false
-        number_limits: 3
-        transfer_methods:
-        - local_file
-        - remote_url
-      number_limits: 3
     opening_statement: ''
     retriever_resource:
       enabled: false
@@ -54,15 +27,13 @@ workflow:
       enabled: false
     text_to_speech:
       enabled: false
-      language: ''
-      voice: ''
   graph:
     edges:
     - data:
         isInIteration: false
         isInLoop: false
         sourceType: start
-        targetType: tool
+        targetType: code
       id: 1780455983223-source-1780474443789-target
       source: '1780455983223'
       sourceHandle: source
@@ -73,7 +44,7 @@ workflow:
     - data:
         isInIteration: false
         isInLoop: false
-        sourceType: tool
+        sourceType: code
         targetType: end
       id: 1780474443789-source-1780476300090-target
       source: '1780474443789'
@@ -88,24 +59,21 @@ workflow:
         title: User Input
         type: start
         variables:
-        - default: ''
-          hint: 自动补全 /api_jsonrpc.php
+        - hint: 自动补全 /api_jsonrpc.php
           label: zabbix_url
           options: []
           placeholder: 例如 https://zabbix.example.com
           required: true
           type: text-input
           variable: zabbix_url
-        - default: ''
-          hint: ''
+        - hint: ''
           label: zabbix_user
           options: []
           placeholder: 请输入 Zabbix 用户名
           required: true
           type: text-input
           variable: zabbix_user
-        - default: ''
-          hint: 密码不会写入工作流默认值
+        - hint: 密码不会写入工作流默认值，也不会出现在摘要中
           label: zabbix_password
           options: []
           placeholder: 请输入 Zabbix 密码
@@ -126,29 +94,498 @@ workflow:
       type: custom
       width: 242
     - data:
-        desc: 生成并返回两个可下载的 CSV 文件
-        provider_id: wangrundong/zabbix_csv_exporter/zabbix_csv_exporter
-        provider_name: wangrundong/zabbix_csv_exporter/zabbix_csv_exporter
-        provider_type: builtin
+        code: |
+          import csv
+          import datetime
+          import io
+          import json
+          import re
+          import urllib.error
+          import urllib.request
+
+          TIMEOUT = 20
+          SAFE_COPY_LIMIT = 350000
+          PART_CHAR_LIMIT = 280000
+          MAX_PARTS = 12
+
+          HOST_FIELDS = [
+              "hostid", "host", "name", "status", "status_text", "maintenance_status",
+              "proxyid", "primary_ip", "all_ips", "interface_count", "interfaces_summary",
+              "groupids", "group_names", "template_names",
+          ]
+          GROUP_FIELDS = [
+              "groupid", "name", "host_count", "top_group", "path_depth",
+              "normalized_name", "flags", "uuid",
+          ]
+
+
+          def normalize_text(value):
+              return "" if value is None else str(value).strip()
+
+
+          def normalize_name(value):
+              return re.sub(r"\s+", " ", normalize_text(value).lower())
+
+
+          def trim_cell(value, max_len=1200):
+              text = normalize_text(value)
+              return text if len(text) <= max_len else text[:max_len] + "...[trimmed]"
+
+
+          def safe_error(error, password):
+              detail = str(error)
+              if password:
+                  detail = detail.replace(password, "***")
+              return detail[:1000]
+
+
+          def csv_text(rows, fieldnames):
+              buffer = io.StringIO(newline="")
+              writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction="ignore")
+              writer.writeheader()
+              writer.writerows(rows)
+              return buffer.getvalue()
+
+
+          def csv_line(row, fieldnames):
+              buffer = io.StringIO(newline="")
+              writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction="ignore")
+              writer.writerow(row)
+              return buffer.getvalue()
+
+
+          def split_csv_rows(rows, fieldnames):
+              header = csv_text([], fieldnames)
+              if len(header) > PART_CHAR_LIMIT:
+                  return [], "CSV 表头超过单个分片字符上限。"
+
+              parts = []
+              current = header
+              for row in rows:
+                  line = csv_line(row, fieldnames)
+                  if len(header) + len(line) > PART_CHAR_LIMIT:
+                      return [], "存在单行 CSV 超过单个分片字符上限。"
+                  if len(current) + len(line) > PART_CHAR_LIMIT:
+                      parts.append(current)
+                      current = header + line
+                  else:
+                      current += line
+              parts.append(current)
+
+              if len(parts) > MAX_PARTS:
+                  return [], (
+                      "CSV 数据量超过当前保守分片上限，请提高 MAX_PARTS "
+                      "或使用 plugin/tool 文件输出方案。"
+                  )
+              return parts, ""
+
+
+          def empty_outputs():
+              output = {
+                  "result": "",
+                  "zabbix_hosts_filename": "",
+                  "zabbix_hostgroups_filename": "",
+                  "zabbix_hosts_csv": "",
+                  "zabbix_hostgroups_csv": "",
+              }
+              for prefix in ("zabbix_hosts_csv_part_", "zabbix_hostgroups_csv_part_"):
+                  for index in range(1, MAX_PARTS + 1):
+                      output[prefix + f"{index:02d}"] = ""
+              return output
+
+
+          def failure_result(snapshot_id, exported_at, zabbix_url, message, detail):
+              return (
+                  "# Zabbix 数据导出失败\n\n"
+                  f"- 巡检批次：{snapshot_id}\n"
+                  f"- 导出时间：{exported_at}\n"
+                  f"- Zabbix 地址：{zabbix_url or '未提供'}\n"
+                  f"- 错误：{message}\n"
+                  f"- 错误摘要：{detail}"
+              )
+
+
+          def build_host_rows(hosts):
+              rows = []
+              for host in hosts:
+                  interfaces = host.get("interfaces", []) or []
+                  groups = host.get("hostgroups") or host.get("groups") or []
+                  templates = host.get("parentTemplates", []) or []
+                  ips = [
+                      normalize_text(item.get("ip"))
+                      for item in interfaces
+                      if normalize_text(item.get("ip"))
+                  ]
+                  main_ips = [
+                      normalize_text(item.get("ip"))
+                      for item in interfaces
+                      if normalize_text(item.get("main")) == "1" and normalize_text(item.get("ip"))
+                  ]
+                  interface_summary = [
+                      "ip={}|dns={}|port={}|type={}|main={}|useip={}".format(
+                          normalize_text(item.get("ip")),
+                          normalize_text(item.get("dns")),
+                          normalize_text(item.get("port")),
+                          normalize_text(item.get("type")),
+                          normalize_text(item.get("main")),
+                          normalize_text(item.get("useip")),
+                      )
+                      for item in interfaces
+                  ]
+                  groupids = [
+                      normalize_text(item.get("groupid"))
+                      for item in groups
+                      if normalize_text(item.get("groupid"))
+                  ]
+                  group_names = [
+                      normalize_text(item.get("name"))
+                      for item in groups
+                      if normalize_text(item.get("name"))
+                  ]
+                  template_names = [
+                      normalize_text(item.get("name"))
+                      for item in templates
+                      if normalize_text(item.get("name"))
+                  ]
+                  status = normalize_text(host.get("status"))
+                  rows.append({
+                      "hostid": normalize_text(host.get("hostid")),
+                      "host": normalize_text(host.get("host")),
+                      "name": normalize_text(host.get("name")),
+                      "status": status,
+                      "status_text": "enabled" if status == "0" else "disabled" if status == "1" else "",
+                      "maintenance_status": normalize_text(host.get("maintenance_status")),
+                      "proxyid": normalize_text(host.get("proxyid")),
+                      "primary_ip": main_ips[0] if main_ips else ips[0] if ips else "",
+                      "all_ips": trim_cell(";".join(ips), 1200),
+                      "interface_count": len(interfaces),
+                      "interfaces_summary": trim_cell(";".join(interface_summary), 2000),
+                      "groupids": trim_cell(";".join(groupids), 1200),
+                      "group_names": trim_cell(";".join(group_names), 2000),
+                      "template_names": trim_cell(";".join(template_names), 2000),
+                  })
+              return rows
+
+
+          def build_group_rows(hostgroups):
+              rows = []
+              for group in hostgroups:
+                  group_name = normalize_text(group.get("name"))
+                  parts = [part for part in group_name.split("/") if part]
+                  hosts_count = group.get("hosts", "")
+                  rows.append({
+                      "groupid": normalize_text(group.get("groupid")),
+                      "name": group_name,
+                      "host_count": len(hosts_count) if isinstance(hosts_count, list) else normalize_text(hosts_count),
+                      "top_group": parts[0] if parts else group_name,
+                      "path_depth": len(parts) if parts else 1,
+                      "normalized_name": normalize_name(group_name),
+                      "flags": normalize_text(group.get("flags")),
+                      "uuid": normalize_text(group.get("uuid")),
+                  })
+              return rows
+
+
+          def put_csv_output(output, key, rows, fieldnames):
+              content = csv_text(rows, fieldnames)
+              if len(content) < SAFE_COPY_LIMIT:
+                  output[key] = content
+                  return "完整", 0, ""
+
+              parts, error = split_csv_rows(rows, fieldnames)
+              if error:
+                  output[key] = ""
+                  return "超过分片上限，未输出", 0, error
+
+              output[key] = ""
+              for index, part in enumerate(parts, start=1):
+                  output[f"{key}_part_{index:02d}"] = part
+              return "分片", len(parts), ""
+
+
+          def main(zabbix_url, zabbix_user, zabbix_password):
+              output = empty_outputs()
+              zabbix_url = normalize_text(zabbix_url)
+              zabbix_user = normalize_text(zabbix_user)
+              zabbix_password = normalize_text(zabbix_password)
+
+              now = datetime.datetime.now()
+              exported_at = now.strftime("%Y-%m-%d %H:%M:%S")
+              snapshot_id = "zabbix_export_" + now.strftime("%Y%m%d_%H%M%S")
+              hosts_filename = f"02_zabbix_hosts_{snapshot_id}.csv"
+              groups_filename = f"03_zabbix_hostgroups_{snapshot_id}.csv"
+              output["zabbix_hosts_filename"] = hosts_filename
+              output["zabbix_hostgroups_filename"] = groups_filename
+
+              missing = [
+                  name
+                  for name, value in (
+                      ("zabbix_url", zabbix_url),
+                      ("zabbix_user", zabbix_user),
+                      ("zabbix_password", zabbix_password),
+                  )
+                  if not value
+              ]
+              if missing:
+                  output["result"] = failure_result(
+                      snapshot_id,
+                      exported_at,
+                      zabbix_url,
+                      "参数校验失败",
+                      "缺少必填参数：" + ", ".join(missing),
+                  )
+                  return output
+
+              if not zabbix_url.endswith("api_jsonrpc.php"):
+                  zabbix_url = zabbix_url.rstrip("/") + "/api_jsonrpc.php"
+
+              def post_json(payload):
+                  body = json.dumps(payload).encode("utf-8")
+                  request = urllib.request.Request(
+                      zabbix_url,
+                      data=body,
+                      headers={
+                          "Content-Type": "application/json-rpc",
+                          "Accept": "application/json",
+                      },
+                      method="POST",
+                  )
+                  try:
+                      with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+                          raw = response.read().decode("utf-8")
+                  except urllib.error.HTTPError as error:
+                      raise RuntimeError(f"HTTP {error.code}")
+                  except urllib.error.URLError as error:
+                      raise RuntimeError(f"连接失败：{error.reason}")
+                  except Exception as error:
+                      raise RuntimeError(
+                          f"请求失败：{type(error).__name__}: {safe_error(error, zabbix_password)}"
+                      )
+
+                  try:
+                      data = json.loads(raw)
+                  except Exception:
+                      raise RuntimeError("Zabbix 返回内容不是合法 JSON")
+                  if "error" in data:
+                      raise RuntimeError(
+                          "Zabbix API Error: " + json.dumps(data["error"], ensure_ascii=False)
+                      )
+                  if "result" not in data:
+                      raise RuntimeError("Zabbix API 返回中没有 result 字段")
+                  return data["result"]
+
+              def zabbix_call(method, params, auth_token=None, request_id=1):
+                  payload = {
+                      "jsonrpc": "2.0",
+                      "method": method,
+                      "params": params,
+                      "id": request_id,
+                  }
+                  if auth_token:
+                      payload["auth"] = auth_token
+                  return post_json(payload)
+
+              try:
+                  try:
+                      auth_token = zabbix_call(
+                          "user.login",
+                          {"username": zabbix_user, "password": zabbix_password},
+                          request_id=1,
+                      )
+                  except Exception:
+                      auth_token = zabbix_call(
+                          "user.login",
+                          {"user": zabbix_user, "password": zabbix_password},
+                          request_id=11,
+                      )
+              except Exception as error:
+                  output["result"] = failure_result(
+                      snapshot_id,
+                      exported_at,
+                      zabbix_url,
+                      "Zabbix 登录失败",
+                      safe_error(error, zabbix_password),
+                  )
+                  return output
+
+              host_output = ["hostid", "host", "name", "status", "maintenance_status", "proxyid"]
+              interfaces = ["interfaceid", "ip", "dns", "port", "type", "main", "useip"]
+              templates = ["templateid", "name"]
+              host_params_new = {
+                  "output": host_output,
+                  "selectInterfaces": interfaces,
+                  "selectHostGroups": ["groupid", "name"],
+                  "selectParentTemplates": templates,
+                  "sortfield": "host",
+              }
+              host_params_old = {
+                  "output": host_output,
+                  "selectInterfaces": interfaces,
+                  "selectGroups": ["groupid", "name"],
+                  "selectParentTemplates": templates,
+                  "sortfield": "host",
+              }
+              try:
+                  try:
+                      hosts = zabbix_call("host.get", host_params_new, auth_token, 2) or []
+                  except Exception:
+                      hosts = zabbix_call("host.get", host_params_old, auth_token, 22) or []
+              except Exception as error:
+                  output["result"] = failure_result(
+                      snapshot_id,
+                      exported_at,
+                      zabbix_url,
+                      "获取 Zabbix 主机失败",
+                      safe_error(error, zabbix_password),
+                  )
+                  return output
+
+              group_params_with_uuid = {
+                  "output": ["groupid", "name", "flags", "uuid"],
+                  "selectHosts": "count",
+                  "sortfield": "name",
+              }
+              group_params_without_uuid = {
+                  "output": ["groupid", "name", "flags"],
+                  "selectHosts": "count",
+                  "sortfield": "name",
+              }
+              try:
+                  try:
+                      hostgroups = zabbix_call(
+                          "hostgroup.get", group_params_with_uuid, auth_token, 3
+                      ) or []
+                  except Exception:
+                      hostgroups = zabbix_call(
+                          "hostgroup.get", group_params_without_uuid, auth_token, 33
+                      ) or []
+              except Exception as error:
+                  output["result"] = failure_result(
+                      snapshot_id,
+                      exported_at,
+                      zabbix_url,
+                      "获取 Zabbix 主机群组失败",
+                      safe_error(error, zabbix_password),
+                  )
+                  return output
+
+              host_rows = build_host_rows(hosts)
+              group_rows = build_group_rows(hostgroups)
+              host_mode, host_part_count, host_error = put_csv_output(
+                  output, "zabbix_hosts_csv", host_rows, HOST_FIELDS
+              )
+              group_mode, group_part_count, group_error = put_csv_output(
+                  output, "zabbix_hostgroups_csv", group_rows, GROUP_FIELDS
+              )
+              if host_error:
+                  host_error = "主机 CSV：" + host_error
+              if group_error:
+                  group_error = "主机群组 CSV：" + group_error
+
+              enabled_hosts = sum(1 for row in host_rows if row.get("status") == "0")
+              disabled_hosts = sum(1 for row in host_rows if row.get("status") == "1")
+              hosts_without_ip = sum(1 for row in host_rows if not row.get("primary_ip"))
+              hosts_without_group = sum(1 for row in host_rows if not row.get("group_names"))
+              errors = [error for error in (host_error, group_error) if error]
+              error_section = ""
+              if errors:
+                  error_section = "\n\n## 输出错误\n\n" + "\n".join(
+                      f"- {error}" for error in errors
+                  )
+              result_title = (
+                  "# Zabbix 数据导出完成（部分 CSV 未输出）"
+                  if errors
+                  else "# Zabbix 数据导出完成"
+              )
+
+              output["result"] = (
+                  result_title + "\n\n"
+                  f"- 巡检批次：{snapshot_id}\n"
+                  f"- 导出时间：{exported_at}\n"
+                  f"- 主机总数：{len(host_rows)}\n"
+                  f"- 启用主机：{enabled_hosts}\n"
+                  f"- 停用主机：{disabled_hosts}\n"
+                  f"- 未识别到主 IP 的主机：{hosts_without_ip}\n"
+                  f"- 未识别到主机群组的主机：{hosts_without_group}\n"
+                  f"- 主机群组总数：{len(group_rows)}\n"
+                  f"- 主机 CSV 推荐文件名：{hosts_filename}\n"
+                  f"- 主机群组 CSV 推荐文件名：{groups_filename}\n"
+                  f"- 主机 CSV 输出模式：{host_mode}\n"
+                  f"- 主机 CSV 分片数量：{host_part_count}\n"
+                  f"- 主机群组 CSV 输出模式：{group_mode}\n"
+                  f"- 主机群组 CSV 分片数量：{group_part_count}\n\n"
+                  "## 如何保存\n\n"
+                  "如果输出模式是“完整”：\n"
+                  "1. 复制对应 `zabbix_hosts_csv` 或 `zabbix_hostgroups_csv` 变量中的全部内容。\n"
+                  "2. 在本地新建摘要所示的同名 `.csv` 文件。\n"
+                  "3. 用 UTF-8 编码保存。\n\n"
+                  "如果输出模式是“分片”：\n"
+                  "1. 按 part 编号复制对应的非空变量。\n"
+                  "2. 每个 part 分别保存为原文件名追加 `_part01.csv`、`_part02.csv` 等编号的文件。\n"
+                  "3. 每个 part 都包含表头，可以直接用 Excel/WPS 打开；不需要拼接。\n"
+                  "4. 如需合并为原始总文件，仅保留第一个 part 的表头，移除后续 part 的表头后按编号合并。"
+                  + error_section
+              )
+              return output
+        code_language: python3
+        desc: 获取 Zabbix 数据；小 CSV 完整输出，大 CSV 按行切成带表头的独立分片
+        outputs:
+          result:
+            children: null
+            type: string
+          zabbix_hosts_filename:
+            children: null
+            type: string
+          zabbix_hostgroups_filename:
+            children: null
+            type: string
+          zabbix_hosts_csv:
+            children: null
+            type: string
+          zabbix_hostgroups_csv:
+            children: null
+            type: string
+          zabbix_hosts_csv_part_01: {children: null, type: string}
+          zabbix_hosts_csv_part_02: {children: null, type: string}
+          zabbix_hosts_csv_part_03: {children: null, type: string}
+          zabbix_hosts_csv_part_04: {children: null, type: string}
+          zabbix_hosts_csv_part_05: {children: null, type: string}
+          zabbix_hosts_csv_part_06: {children: null, type: string}
+          zabbix_hosts_csv_part_07: {children: null, type: string}
+          zabbix_hosts_csv_part_08: {children: null, type: string}
+          zabbix_hosts_csv_part_09: {children: null, type: string}
+          zabbix_hosts_csv_part_10: {children: null, type: string}
+          zabbix_hosts_csv_part_11: {children: null, type: string}
+          zabbix_hosts_csv_part_12: {children: null, type: string}
+          zabbix_hostgroups_csv_part_01: {children: null, type: string}
+          zabbix_hostgroups_csv_part_02: {children: null, type: string}
+          zabbix_hostgroups_csv_part_03: {children: null, type: string}
+          zabbix_hostgroups_csv_part_04: {children: null, type: string}
+          zabbix_hostgroups_csv_part_05: {children: null, type: string}
+          zabbix_hostgroups_csv_part_06: {children: null, type: string}
+          zabbix_hostgroups_csv_part_07: {children: null, type: string}
+          zabbix_hostgroups_csv_part_08: {children: null, type: string}
+          zabbix_hostgroups_csv_part_09: {children: null, type: string}
+          zabbix_hostgroups_csv_part_10: {children: null, type: string}
+          zabbix_hostgroups_csv_part_11: {children: null, type: string}
+          zabbix_hostgroups_csv_part_12: {children: null, type: string}
         selected: false
-        title: Export Zabbix CSV
-        tool_configurations: {}
-        tool_description: Export Zabbix hosts and host groups as downloadable CSV files.
-        tool_label: Export Zabbix CSV
-        tool_name: zabbix_export_csv
-        tool_node_version: '2'
-        tool_parameters:
-          zabbix_password:
-            type: mixed
-            value: '{{#1780455983223.zabbix_password#}}'
-          zabbix_url:
-            type: mixed
-            value: '{{#1780455983223.zabbix_url#}}'
-          zabbix_user:
-            type: mixed
-            value: '{{#1780455983223.zabbix_user#}}'
-        type: tool
-      height: 90
+        title: Fetch and Split Zabbix CSV
+        type: code
+        variables:
+        - value_selector:
+          - '1780455983223'
+          - zabbix_url
+          variable: zabbix_url
+        - value_selector:
+          - '1780455983223'
+          - zabbix_user
+          variable: zabbix_user
+        - value_selector:
+          - '1780455983223'
+          - zabbix_password
+          variable: zabbix_password
+      height: 98
       id: '1780474443789'
       position:
         x: 382
@@ -163,16 +600,35 @@ workflow:
       width: 242
     - data:
         outputs:
-        - value_selector:
-          - '1780474443789'
-          - text
-          value_type: string
-          variable: result
-        - value_selector:
-          - '1780474443789'
-          - files
-          value_type: array[file]
-          variable: zabbix_files
+        - {value_selector: ['1780474443789', result], value_type: string, variable: result}
+        - {value_selector: ['1780474443789', zabbix_hosts_filename], value_type: string, variable: zabbix_hosts_filename}
+        - {value_selector: ['1780474443789', zabbix_hostgroups_filename], value_type: string, variable: zabbix_hostgroups_filename}
+        - {value_selector: ['1780474443789', zabbix_hosts_csv], value_type: string, variable: zabbix_hosts_csv}
+        - {value_selector: ['1780474443789', zabbix_hostgroups_csv], value_type: string, variable: zabbix_hostgroups_csv}
+        - {value_selector: ['1780474443789', zabbix_hosts_csv_part_01], value_type: string, variable: zabbix_hosts_csv_part_01}
+        - {value_selector: ['1780474443789', zabbix_hosts_csv_part_02], value_type: string, variable: zabbix_hosts_csv_part_02}
+        - {value_selector: ['1780474443789', zabbix_hosts_csv_part_03], value_type: string, variable: zabbix_hosts_csv_part_03}
+        - {value_selector: ['1780474443789', zabbix_hosts_csv_part_04], value_type: string, variable: zabbix_hosts_csv_part_04}
+        - {value_selector: ['1780474443789', zabbix_hosts_csv_part_05], value_type: string, variable: zabbix_hosts_csv_part_05}
+        - {value_selector: ['1780474443789', zabbix_hosts_csv_part_06], value_type: string, variable: zabbix_hosts_csv_part_06}
+        - {value_selector: ['1780474443789', zabbix_hosts_csv_part_07], value_type: string, variable: zabbix_hosts_csv_part_07}
+        - {value_selector: ['1780474443789', zabbix_hosts_csv_part_08], value_type: string, variable: zabbix_hosts_csv_part_08}
+        - {value_selector: ['1780474443789', zabbix_hosts_csv_part_09], value_type: string, variable: zabbix_hosts_csv_part_09}
+        - {value_selector: ['1780474443789', zabbix_hosts_csv_part_10], value_type: string, variable: zabbix_hosts_csv_part_10}
+        - {value_selector: ['1780474443789', zabbix_hosts_csv_part_11], value_type: string, variable: zabbix_hosts_csv_part_11}
+        - {value_selector: ['1780474443789', zabbix_hosts_csv_part_12], value_type: string, variable: zabbix_hosts_csv_part_12}
+        - {value_selector: ['1780474443789', zabbix_hostgroups_csv_part_01], value_type: string, variable: zabbix_hostgroups_csv_part_01}
+        - {value_selector: ['1780474443789', zabbix_hostgroups_csv_part_02], value_type: string, variable: zabbix_hostgroups_csv_part_02}
+        - {value_selector: ['1780474443789', zabbix_hostgroups_csv_part_03], value_type: string, variable: zabbix_hostgroups_csv_part_03}
+        - {value_selector: ['1780474443789', zabbix_hostgroups_csv_part_04], value_type: string, variable: zabbix_hostgroups_csv_part_04}
+        - {value_selector: ['1780474443789', zabbix_hostgroups_csv_part_05], value_type: string, variable: zabbix_hostgroups_csv_part_05}
+        - {value_selector: ['1780474443789', zabbix_hostgroups_csv_part_06], value_type: string, variable: zabbix_hostgroups_csv_part_06}
+        - {value_selector: ['1780474443789', zabbix_hostgroups_csv_part_07], value_type: string, variable: zabbix_hostgroups_csv_part_07}
+        - {value_selector: ['1780474443789', zabbix_hostgroups_csv_part_08], value_type: string, variable: zabbix_hostgroups_csv_part_08}
+        - {value_selector: ['1780474443789', zabbix_hostgroups_csv_part_09], value_type: string, variable: zabbix_hostgroups_csv_part_09}
+        - {value_selector: ['1780474443789', zabbix_hostgroups_csv_part_10], value_type: string, variable: zabbix_hostgroups_csv_part_10}
+        - {value_selector: ['1780474443789', zabbix_hostgroups_csv_part_11], value_type: string, variable: zabbix_hostgroups_csv_part_11}
+        - {value_selector: ['1780474443789', zabbix_hostgroups_csv_part_12], value_type: string, variable: zabbix_hostgroups_csv_part_12}
         selected: false
         title: Output
         type: end
