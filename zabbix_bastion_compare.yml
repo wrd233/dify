@@ -1,0 +1,369 @@
+app:
+  description: 按 IP 对比堡垒机虚拟机 CSV 与 Zabbix 主机 CSV
+  icon: 🔍
+  icon_background: '#E8F5E9'
+  icon_type: emoji
+  mode: workflow
+  name: Zabbix 与堡垒机主机对比
+  use_icon_as_answer_icon: false
+dependencies: []
+kind: app
+version: 0.6.0
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      enabled: false
+    opening_statement: ''
+    retriever_resource:
+      enabled: false
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+  graph:
+    edges:
+    - data: {isInIteration: false, isInLoop: false, sourceType: start, targetType: code}
+      id: 1800000000001-source-1800000000002-target
+      source: '1800000000001'
+      sourceHandle: source
+      target: '1800000000002'
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data: {isInIteration: false, isInLoop: false, sourceType: code, targetType: code}
+      id: 1800000000002-source-1800000000003-target
+      source: '1800000000002'
+      sourceHandle: source
+      target: '1800000000003'
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data: {isInIteration: false, isInLoop: false, sourceType: code, targetType: end}
+      id: 1800000000003-source-1800000000004-target
+      source: '1800000000003'
+      sourceHandle: source
+      target: '1800000000004'
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    nodes:
+    - data:
+        selected: false
+        title: CSV Input
+        type: start
+        variables:
+        - hint: 粘贴堡垒机导出的虚拟机 CSV 全部内容
+          label: bastion_hosts_csv
+          max_length: 5000000
+          options: []
+          placeholder: ''
+          required: true
+          type: paragraph
+          variable: bastion_hosts_csv
+        - hint: 粘贴 Zabbix 主机 CSV 全部内容
+          label: zabbix_hosts_csv
+          max_length: 5000000
+          options: []
+          placeholder: ''
+          required: true
+          type: paragraph
+          variable: zabbix_hosts_csv
+        - hint: 本次仅作为辅助输入保留
+          label: zabbix_groups_csv
+          max_length: 5000000
+          options: []
+          placeholder: ''
+          required: false
+          type: paragraph
+          variable: zabbix_groups_csv
+      height: 161
+      id: '1800000000001'
+      position: {x: 80, y: 280}
+      positionAbsolute: {x: 80, y: 280}
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        code: |
+          import csv
+          import io
+          import ipaddress
+
+          FIELDS = [
+              "bastion_name", "ip", "protocol", "port", "os_type",
+              "department", "resource_tag",
+          ]
+
+
+          def clean(value):
+              return "" if value is None else str(value).strip()
+
+
+          def valid_ip(value):
+              try:
+                  return str(ipaddress.IPv4Address(clean(value)))
+              except Exception:
+                  return ""
+
+
+          def parse_csv(text):
+              text = clean(text).lstrip("\ufeff")
+              if not text:
+                  return []
+              reader = csv.DictReader(io.StringIO(text))
+              reader.fieldnames = [clean(name) for name in (reader.fieldnames or [])]
+              return [{clean(key): clean(value) for key, value in row.items() if key} for row in reader]
+
+
+          def write_csv(rows):
+              output = io.StringIO(newline="")
+              writer = csv.DictWriter(output, fieldnames=FIELDS, extrasaction="ignore")
+              writer.writeheader()
+              writer.writerows(rows)
+              return output.getvalue()
+
+
+          def merge_values(left, right):
+              values = []
+              for value in (left + ";" + right).split(";"):
+                  value = clean(value)
+                  if value and value not in values:
+                      values.append(value)
+              return ";".join(values)
+
+
+          def main(bastion_hosts_csv: str) -> dict:
+              hosts = {}
+              for row in parse_csv(bastion_hosts_csv):
+                  ip = valid_ip(row.get("主机/应用地址"))
+                  if not ip:
+                      continue
+                  item = {
+                      "bastion_name": clean(row.get("资源名称")),
+                      "ip": ip,
+                      "protocol": clean(row.get("协议")),
+                      "port": clean(row.get("资源端口")),
+                      "os_type": clean(row.get("系统类型")),
+                      "department": clean(row.get("所属部门")),
+                      "resource_tag": clean(row.get("资源标签")),
+                  }
+                  old = hosts.get(ip)
+                  if not old:
+                      hosts[ip] = item
+                      continue
+                  if sum(bool(value) for value in item.values()) > sum(bool(value) for value in old.values()):
+                      item["protocol"] = merge_values(item["protocol"], old["protocol"])
+                      item["port"] = merge_values(item["port"], old["port"])
+                      hosts[ip] = item
+                  else:
+                      old["protocol"] = merge_values(old["protocol"], item["protocol"])
+                      old["port"] = merge_values(old["port"], item["port"])
+
+              return {"normalized_bastion_csv": write_csv(hosts.values())}
+        code_language: python3
+        desc: 清洗堡垒机 CSV，过滤非法 IP，并按 IP 合并重复资源
+        outputs:
+          normalized_bastion_csv: {children: null, type: string}
+        selected: false
+        title: normalize_bastion_csv
+        type: code
+        variables:
+        - value_selector: ['1800000000001', bastion_hosts_csv]
+          variable: bastion_hosts_csv
+      height: 98
+      id: '1800000000002'
+      position: {x: 380, y: 280}
+      positionAbsolute: {x: 380, y: 280}
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        code: |
+          import csv
+          import io
+          import ipaddress
+          import re
+
+          NAME_DIFF_FIELDS = [
+              "ip", "bastion_name", "zabbix_name", "zabbix_host", "zabbix_hostid",
+              "bastion_os_type", "bastion_protocol", "bastion_port",
+              "bastion_department", "bastion_resource_tag", "zabbix_status",
+              "zabbix_group_names", "zabbix_template_names",
+          ]
+          BASTION_ONLY_FIELDS = [
+              "ip", "bastion_name", "bastion_os_type", "bastion_protocol",
+              "bastion_port", "bastion_department", "bastion_resource_tag",
+          ]
+          ZABBIX_ONLY_FIELDS = [
+              "ip", "zabbix_name", "zabbix_host", "zabbix_hostid",
+              "zabbix_status", "zabbix_group_names", "zabbix_template_names",
+          ]
+
+
+          def clean(value):
+              return "" if value is None else str(value).strip()
+
+
+          def parse_csv(text):
+              text = clean(text).lstrip("\ufeff")
+              if not text:
+                  return []
+              reader = csv.DictReader(io.StringIO(text))
+              reader.fieldnames = [clean(name) for name in (reader.fieldnames or [])]
+              return [{clean(key): clean(value) for key, value in row.items() if key} for row in reader]
+
+
+          def write_csv(rows, fields):
+              output = io.StringIO(newline="")
+              writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+              writer.writeheader()
+              writer.writerows(rows)
+              return output.getvalue()
+
+
+          def ips_from(row):
+              values = [clean(row.get("primary_ip"))]
+              values += re.split(r"[,;\s]+", clean(row.get("all_ips")))
+              ips = []
+              for value in values:
+                  try:
+                      ip = str(ipaddress.IPv4Address(value))
+                      if ip not in ips:
+                          ips.append(ip)
+                  except Exception:
+                      pass
+              return ips
+
+
+          def zabbix_values(ip, bastion, zabbix):
+              return {
+                  "ip": ip,
+                  "bastion_name": bastion.get("bastion_name", ""),
+                  "zabbix_name": zabbix.get("name", ""),
+                  "zabbix_host": zabbix.get("host", ""),
+                  "zabbix_hostid": zabbix.get("hostid", ""),
+                  "bastion_os_type": bastion.get("os_type", ""),
+                  "bastion_protocol": bastion.get("protocol", ""),
+                  "bastion_port": bastion.get("port", ""),
+                  "bastion_department": bastion.get("department", ""),
+                  "bastion_resource_tag": bastion.get("resource_tag", ""),
+                  "zabbix_status": zabbix.get("status", ""),
+                  "zabbix_group_names": zabbix.get("group_names", ""),
+                  "zabbix_template_names": zabbix.get("template_names", ""),
+              }
+
+
+          def main(normalized_bastion_csv: str, zabbix_hosts_csv: str, zabbix_groups_csv: str) -> dict:
+              bastion_rows = parse_csv(normalized_bastion_csv)
+              zabbix_rows = parse_csv(zabbix_hosts_csv)
+              bastion_by_ip = {row.get("ip", ""): row for row in bastion_rows if row.get("ip")}
+
+              # Multiple Zabbix hosts sharing an IP are handled conservatively: keep the first.
+              zabbix_by_ip = {}
+              for row in zabbix_rows:
+                  row_ips = ips_from(row)
+                  for ip in row_ips:
+                      zabbix_by_ip.setdefault(ip, row)
+
+              name_diff = []
+              bastion_only = []
+              for ip, bastion in bastion_by_ip.items():
+                  zabbix = zabbix_by_ip.get(ip)
+                  if not zabbix:
+                      bastion_only.append({
+                          "ip": ip,
+                          "bastion_name": bastion.get("bastion_name", ""),
+                          "bastion_os_type": bastion.get("os_type", ""),
+                          "bastion_protocol": bastion.get("protocol", ""),
+                          "bastion_port": bastion.get("port", ""),
+                          "bastion_department": bastion.get("department", ""),
+                          "bastion_resource_tag": bastion.get("resource_tag", ""),
+                      })
+                  elif clean(bastion.get("bastion_name")).casefold() != clean(zabbix.get("name")).casefold():
+                      name_diff.append(zabbix_values(ip, bastion, zabbix))
+
+              zabbix_only = []
+              matched_hostids = {
+                  row.get("hostid", "")
+                  for ip, row in zabbix_by_ip.items()
+                  if ip in bastion_by_ip
+              }
+              emitted_hostids = set()
+              for ip, row in zabbix_by_ip.items():
+                  hostid = row.get("hostid", "")
+                  if hostid in matched_hostids or hostid in emitted_hostids:
+                      continue
+                  emitted_hostids.add(hostid)
+                  zabbix_only.append({
+                      "ip": ip,
+                      "zabbix_name": row.get("name", ""),
+                      "zabbix_host": row.get("host", ""),
+                      "zabbix_hostid": row.get("hostid", ""),
+                      "zabbix_status": row.get("status", ""),
+                      "zabbix_group_names": row.get("group_names", ""),
+                      "zabbix_template_names": row.get("template_names", ""),
+                  })
+
+              return {
+                  "name_diff_csv": write_csv(name_diff, NAME_DIFF_FIELDS),
+                  "bastion_only_csv": write_csv(bastion_only, BASTION_ONLY_FIELDS),
+                  "zabbix_only_csv": write_csv(zabbix_only, ZABBIX_ONLY_FIELDS),
+              }
+        code_language: python3
+        desc: 按 primary_ip 和 all_ips 对比堡垒机与 Zabbix 主机
+        outputs:
+          name_diff_csv: {children: null, type: string}
+          bastion_only_csv: {children: null, type: string}
+          zabbix_only_csv: {children: null, type: string}
+        selected: false
+        title: compare_bastion_with_zabbix
+        type: code
+        variables:
+        - value_selector: ['1800000000002', normalized_bastion_csv]
+          variable: normalized_bastion_csv
+        - value_selector: ['1800000000001', zabbix_hosts_csv]
+          variable: zabbix_hosts_csv
+        - value_selector: ['1800000000001', zabbix_groups_csv]
+          variable: zabbix_groups_csv
+      height: 98
+      id: '1800000000003'
+      position: {x: 680, y: 280}
+      positionAbsolute: {x: 680, y: 280}
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        outputs:
+        - {value_selector: ['1800000000003', name_diff_csv], value_type: string, variable: name_diff_csv}
+        - {value_selector: ['1800000000003', bastion_only_csv], value_type: string, variable: bastion_only_csv}
+        - {value_selector: ['1800000000003', zabbix_only_csv], value_type: string, variable: zabbix_only_csv}
+        selected: false
+        title: Output
+        type: end
+      height: 116
+      id: '1800000000004'
+      position: {x: 980, y: 280}
+      positionAbsolute: {x: 980, y: 280}
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    viewport:
+      x: 100
+      y: 80
+      zoom: 0.9
+  rag_pipeline_variables: []
