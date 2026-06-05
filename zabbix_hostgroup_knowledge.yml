@@ -1,0 +1,361 @@
+app:
+  description: 根据 Zabbix 主机与主机群组 CSV 生成主机群组推荐知识表
+  icon: 🧭
+  icon_background: '#E0F2FE'
+  icon_type: emoji
+  mode: workflow
+  name: Zabbix 主机群组知识 CSV
+  use_icon_as_answer_icon: false
+dependencies: []
+kind: app
+version: 0.6.0
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      enabled: false
+    opening_statement: ''
+    retriever_resource:
+      enabled: false
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+  graph:
+    edges:
+    - data: {isInIteration: false, isInLoop: false, sourceType: start, targetType: code}
+      id: 1810000000001-source-1810000000002-target
+      source: '1810000000001'
+      sourceHandle: source
+      target: '1810000000002'
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data: {isInIteration: false, isInLoop: false, sourceType: code, targetType: llm}
+      id: 1810000000002-source-1810000000003-target
+      source: '1810000000002'
+      sourceHandle: source
+      target: '1810000000003'
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data: {isInIteration: false, isInLoop: false, sourceType: llm, targetType: code}
+      id: 1810000000003-source-1810000000004-target
+      source: '1810000000003'
+      sourceHandle: source
+      target: '1810000000004'
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data: {isInIteration: false, isInLoop: false, sourceType: code, targetType: end}
+      id: 1810000000004-source-1810000000005-target
+      source: '1810000000004'
+      sourceHandle: source
+      target: '1810000000005'
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    nodes:
+    - data:
+        selected: false
+        title: CSV Input
+        type: start
+        variables:
+        - hint: 粘贴 Zabbix 信息获取工作流输出的 zabbix_hosts_csv
+          label: zabbix_hosts_csv
+          max_length: 5000000
+          options: []
+          placeholder: ''
+          required: true
+          type: paragraph
+          variable: zabbix_hosts_csv
+        - hint: 粘贴 Zabbix 信息获取工作流输出的 zabbix_hostgroups_csv
+          label: zabbix_hostgroups_csv
+          max_length: 5000000
+          options: []
+          placeholder: ''
+          required: true
+          type: paragraph
+          variable: zabbix_hostgroups_csv
+      height: 134
+      id: '1810000000001'
+      position: {x: 80, y: 280}
+      positionAbsolute: {x: 80, y: 280}
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        code: |
+          import csv
+          import io
+          import json
+
+          MAX_GROUPS = 160
+          MAX_SAMPLES = 8
+          MAX_TEMPLATE_SAMPLES = 10
+
+
+          def clean(value):
+              return "" if value is None else str(value).strip()
+
+
+          def parse_csv(text):
+              text = clean(text).lstrip("\ufeff")
+              if not text:
+                  return []
+              reader = csv.DictReader(io.StringIO(text))
+              reader.fieldnames = [clean(name) for name in (reader.fieldnames or [])]
+              return [{clean(key): clean(value) for key, value in row.items() if key} for row in reader]
+
+
+          def split_values(value):
+              values = []
+              for item in clean(value).split(";"):
+                  item = clean(item)
+                  if item and item not in values:
+                      values.append(item)
+              return values
+
+
+          def add_sample(values, value, limit):
+              value = clean(value)
+              if value and value not in values and len(values) < limit:
+                  values.append(value)
+
+
+          def main(zabbix_hosts_csv: str, zabbix_hostgroups_csv: str) -> dict:
+              hosts = parse_csv(zabbix_hosts_csv)
+              groups = parse_csv(zabbix_hostgroups_csv)
+              by_group = {}
+
+              for group in groups:
+                  name = clean(group.get("name") or group.get("group_name"))
+                  if not name:
+                      continue
+                  by_group.setdefault(name, {
+                      "group_name": name,
+                      "host_count": 0,
+                      "host_name_samples": [],
+                      "host_ip_samples": [],
+                      "template_samples": [],
+                      "fallback_host_count": clean(group.get("host_count")),
+                  })
+
+              for host in hosts:
+                  host_name = clean(host.get("name") or host.get("host"))
+                  host_ip = clean(host.get("primary_ip"))
+                  templates = split_values(host.get("template_names"))
+                  for group_name in split_values(host.get("group_names")):
+                      item = by_group.setdefault(group_name, {
+                          "group_name": group_name,
+                          "host_count": 0,
+                          "host_name_samples": [],
+                          "host_ip_samples": [],
+                          "template_samples": [],
+                          "fallback_host_count": "",
+                      })
+                      item["host_count"] += 1
+                      add_sample(item["host_name_samples"], host_name, MAX_SAMPLES)
+                      add_sample(item["host_ip_samples"], host_ip, MAX_SAMPLES)
+                      for template in templates:
+                          add_sample(item["template_samples"], template, MAX_TEMPLATE_SAMPLES)
+
+              rows = []
+              for item in by_group.values():
+                  count = item["host_count"]
+                  if not count and item["fallback_host_count"].isdigit():
+                      count = int(item["fallback_host_count"])
+                  rows.append({
+                      "group_name": item["group_name"],
+                      "host_count": count,
+                      "host_name_samples": item["host_name_samples"],
+                      "host_ip_samples": item["host_ip_samples"],
+                      "template_samples": item["template_samples"],
+                  })
+
+              rows.sort(key=lambda row: row["group_name"])
+              rows = rows[:MAX_GROUPS]
+              return {
+                  "group_context_json": json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+              }
+        code_language: python3
+        desc: 解析 CSV 并按主机群组聚合主机名、IP、模板样本
+        outputs:
+          group_context_json: {children: null, type: string}
+        selected: false
+        title: aggregate_hostgroup_samples
+        type: code
+        variables:
+        - value_selector: ['1810000000001', zabbix_hosts_csv]
+          variable: zabbix_hosts_csv
+        - value_selector: ['1810000000001', zabbix_hostgroups_csv]
+          variable: zabbix_hostgroups_csv
+      height: 98
+      id: '1810000000002'
+      position: {x: 380, y: 280}
+      positionAbsolute: {x: 380, y: 280}
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        context:
+          enabled: false
+          variable_selector: []
+        desc: 为每个主机群组生成简短语义说明
+        model:
+          completion_params:
+            temperature: 0.1
+          mode: chat
+          name: deepseek-v4-flash
+          provider: langgenius/openai_api_compatible/openai_api_compatible
+        prompt_template:
+        - id: 1810000000003-system
+          role: system
+          text: |
+            你是 Zabbix 主机群组知识整理助手。
+            请根据输入 JSON 中的 group_name、host_count、host_name_samples、host_ip_samples、template_samples，为每个主机群组补充 group_semantic。
+            只输出 JSON 数组，不要输出 Markdown，不要输出代码块，不要解释。
+            每个元素必须只有以下字段：
+            group_name,group_semantic
+            group_semantic 使用中文，控制在 30 字以内，描述该群组可能代表的业务、环境、系统类型或用途。
+            如果样本不足，就根据 group_name 做保守总结。
+        - id: 1810000000003-user
+          role: user
+          text: '{{#1810000000002.group_context_json#}}'
+        selected: false
+        title: summarize_group_semantics
+        type: llm
+        vision:
+          enabled: false
+      height: 98
+      id: '1810000000003'
+      position: {x: 680, y: 280}
+      positionAbsolute: {x: 680, y: 280}
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        code: |
+          import csv
+          import io
+          import json
+          import re
+
+          FIELDS = [
+              "group_name", "group_semantic", "host_count",
+              "host_name_samples", "host_ip_samples", "template_samples",
+          ]
+
+
+          def clean(value):
+              return "" if value is None else str(value).strip()
+
+
+          def load_json(text, default):
+              text = clean(text)
+              if not text:
+                  return default
+              text = re.sub(r"^```(?:json)?\s*", "", text)
+              text = re.sub(r"\s*```$", "", text)
+              try:
+                  return json.loads(text)
+              except Exception:
+                  return default
+
+
+          def join_values(values):
+              if isinstance(values, list):
+                  return ";".join(clean(item) for item in values if clean(item))
+              return clean(values)
+
+
+          def write_csv(rows):
+              output = io.StringIO(newline="")
+              writer = csv.DictWriter(output, fieldnames=FIELDS, extrasaction="ignore")
+              writer.writeheader()
+              writer.writerows(rows)
+              return output.getvalue()
+
+
+          def main(group_context_json: str, llm_text: str) -> dict:
+              context_rows = load_json(group_context_json, [])
+              semantic_rows = load_json(llm_text, [])
+              semantic_by_group = {}
+              if isinstance(semantic_rows, list):
+                  for row in semantic_rows:
+                      if isinstance(row, dict):
+                          name = clean(row.get("group_name"))
+                          semantic = clean(row.get("group_semantic"))
+                          if name and semantic:
+                              semantic_by_group[name] = semantic
+
+              rows = []
+              for item in context_rows if isinstance(context_rows, list) else []:
+                  if not isinstance(item, dict):
+                      continue
+                  group_name = clean(item.get("group_name"))
+                  if not group_name:
+                      continue
+                  rows.append({
+                      "group_name": group_name,
+                      "group_semantic": semantic_by_group.get(group_name, group_name),
+                      "host_count": item.get("host_count", 0),
+                      "host_name_samples": join_values(item.get("host_name_samples")),
+                      "host_ip_samples": join_values(item.get("host_ip_samples")),
+                      "template_samples": join_values(item.get("template_samples")),
+                  })
+
+              return {"hostgroup_knowledge_csv": write_csv(rows)}
+        code_language: python3
+        desc: 合并 LLM 语义并输出标准 CSV
+        outputs:
+          hostgroup_knowledge_csv: {children: null, type: string}
+        selected: false
+        title: build_knowledge_csv
+        type: code
+        variables:
+        - value_selector: ['1810000000002', group_context_json]
+          variable: group_context_json
+        - value_selector: ['1810000000003', text]
+          variable: llm_text
+      height: 98
+      id: '1810000000004'
+      position: {x: 980, y: 280}
+      positionAbsolute: {x: 980, y: 280}
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        outputs:
+        - {value_selector: ['1810000000004', hostgroup_knowledge_csv], value_type: string, variable: hostgroup_knowledge_csv}
+        selected: false
+        title: Output
+        type: end
+      height: 116
+      id: '1810000000005'
+      position: {x: 1280, y: 280}
+      positionAbsolute: {x: 1280, y: 280}
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    viewport:
+      x: 80
+      y: 80
+      zoom: 0.8
+  rag_pipeline_variables: []

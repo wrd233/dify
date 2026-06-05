@@ -1,0 +1,400 @@
+app:
+  description: 基于主机群组知识 CSV 给堡垒机待导入主机推荐 Zabbix 主机群组
+  icon: 🎯
+  icon_background: '#DCFCE7'
+  icon_type: emoji
+  mode: workflow
+  name: Zabbix 主机群组推荐
+  use_icon_as_answer_icon: false
+dependencies: []
+kind: app
+version: 0.6.0
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      enabled: false
+    opening_statement: ''
+    retriever_resource:
+      enabled: false
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+  graph:
+    edges:
+    - data: {isInIteration: false, isInLoop: false, sourceType: start, targetType: code}
+      id: 1820000000001-source-1820000000002-target
+      source: '1820000000001'
+      sourceHandle: source
+      target: '1820000000002'
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data: {isInIteration: false, isInLoop: false, sourceType: code, targetType: llm}
+      id: 1820000000002-source-1820000000003-target
+      source: '1820000000002'
+      sourceHandle: source
+      target: '1820000000003'
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data: {isInIteration: false, isInLoop: false, sourceType: llm, targetType: code}
+      id: 1820000000003-source-1820000000004-target
+      source: '1820000000003'
+      sourceHandle: source
+      target: '1820000000004'
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data: {isInIteration: false, isInLoop: false, sourceType: code, targetType: end}
+      id: 1820000000004-source-1820000000005-target
+      source: '1820000000004'
+      sourceHandle: source
+      target: '1820000000005'
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    nodes:
+    - data:
+        selected: false
+        title: CSV Input
+        type: start
+        variables:
+        - hint: 粘贴对比工作流输出的 bastion_only_csv
+          label: bastion_only_csv
+          max_length: 5000000
+          options: []
+          placeholder: ''
+          required: true
+          type: paragraph
+          variable: bastion_only_csv
+        - hint: 粘贴 zabbix_hostgroup_knowledge 工作流输出的 hostgroup_knowledge_csv
+          label: hostgroup_knowledge_csv
+          max_length: 5000000
+          options: []
+          placeholder: ''
+          required: true
+          type: paragraph
+          variable: hostgroup_knowledge_csv
+        - hint: 可选，默认 0；第 0 片表示第 1 批
+          label: slice_index
+          options: []
+          placeholder: '0'
+          required: false
+          type: text-input
+          variable: slice_index
+        - hint: 可选，默认 50；建议 20-100
+          label: slice_size
+          options: []
+          placeholder: '50'
+          required: false
+          type: text-input
+          variable: slice_size
+      height: 214
+      id: '1820000000001'
+      position: {x: 80, y: 280}
+      positionAbsolute: {x: 80, y: 280}
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        code: |
+          import csv
+          import io
+          import json
+          import ipaddress
+
+          MAX_KNOWLEDGE_ROWS = 160
+
+
+          def clean(value):
+              return "" if value is None else str(value).strip()
+
+
+          def parse_csv(text):
+              text = clean(text).lstrip("\ufeff")
+              if not text:
+                  return []
+              reader = csv.DictReader(io.StringIO(text))
+              reader.fieldnames = [clean(name) for name in (reader.fieldnames or [])]
+              return [{clean(key): clean(value) for key, value in row.items() if key} for row in reader]
+
+
+          def to_int(value, default):
+              try:
+                  return int(clean(value))
+              except Exception:
+                  return default
+
+
+          def normalize_ip(value):
+              try:
+                  return str(ipaddress.IPv4Address(clean(value)))
+              except Exception:
+                  return clean(value)
+
+
+          def main(bastion_only_csv: str, hostgroup_knowledge_csv: str, slice_index: str = "0", slice_size: str = "50") -> dict:
+              all_hosts = parse_csv(bastion_only_csv)
+              knowledge = parse_csv(hostgroup_knowledge_csv)[:MAX_KNOWLEDGE_ROWS]
+              index = max(0, to_int(slice_index, 0))
+              size = max(1, min(100, to_int(slice_size, 50)))
+              total = len(all_hosts)
+              start = index * size
+              end = min(start + size, total)
+              selected = all_hosts[start:end]
+
+              hosts = []
+              for row in selected:
+                  ip = normalize_ip(row.get("ip"))
+                  hosts.append({
+                      "ip": ip,
+                      "name": clean(row.get("bastion_name") or row.get("name")),
+                      "os_type": clean(row.get("bastion_os_type") or row.get("os_type")),
+                      "protocol": clean(row.get("bastion_protocol") or row.get("protocol")),
+                      "port": clean(row.get("bastion_port") or row.get("port")),
+                      "department": clean(row.get("bastion_department") or row.get("department")),
+                      "resource_tag": clean(row.get("bastion_resource_tag") or row.get("resource_tag")),
+                  })
+
+              next_index = index + 1 if end < total else ""
+              if total == 0:
+                  summary = "本次没有可处理主机，共 0 条"
+              elif start >= total:
+                  summary = "本次处理范围超出数据，共 %s 条，请调小 slice_index" % total
+              elif next_index == "":
+                  summary = "本次处理第 %s-%s 条，共 %s 条，已处理到最后一片" % (start + 1, end, total)
+              else:
+                  summary = "本次处理第 %s-%s 条，共 %s 条，后续可继续使用 slice_index=%s" % (start + 1, end, total, next_index)
+
+              return {
+                  "hosts_json": json.dumps(hosts, ensure_ascii=False, separators=(",", ":")),
+                  "knowledge_json": json.dumps(knowledge, ensure_ascii=False, separators=(",", ":")),
+                  "run_summary": summary,
+              }
+        code_language: python3
+        desc: 清洗输入并按 slice_index/slice_size 截取本次要推荐的主机
+        outputs:
+          hosts_json: {children: null, type: string}
+          knowledge_json: {children: null, type: string}
+          run_summary: {children: null, type: string}
+        selected: false
+        title: prepare_slice
+        type: code
+        variables:
+        - value_selector: ['1820000000001', bastion_only_csv]
+          variable: bastion_only_csv
+        - value_selector: ['1820000000001', hostgroup_knowledge_csv]
+          variable: hostgroup_knowledge_csv
+        - value_selector: ['1820000000001', slice_index]
+          variable: slice_index
+        - value_selector: ['1820000000001', slice_size]
+          variable: slice_size
+      height: 98
+      id: '1820000000002'
+      position: {x: 380, y: 280}
+      positionAbsolute: {x: 380, y: 280}
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        context:
+          enabled: false
+          variable_selector: []
+        desc: 基于知识表给待导入主机推荐主机群组
+        model:
+          completion_params:
+            temperature: 0.1
+          mode: chat
+          name: deepseek-v4-flash
+          provider: langgenius/openai_api_compatible/openai_api_compatible
+        prompt_template:
+        - id: 1820000000003-system
+          role: system
+          text: |
+            你是 Zabbix 主机群组推荐助手。
+            你会收到两段 JSON：待导入主机列表 hosts，以及主机群组知识表 knowledge。
+            请根据主机名称、IP、系统类型、部门、资源标签、协议端口，以及 knowledge 中的 group_name、group_semantic、host_name_samples、host_ip_samples、template_samples，给每台主机推荐 Zabbix 主机群组。
+
+            只输出 JSON 数组，不要输出 Markdown，不要输出代码块，不要解释。
+            数组中每个对象必须只有以下字段：
+            ip,name,primary_group,suggested_groups,confidence,need_manual_review
+
+            字段要求：
+            - primary_group 必须来自 suggested_groups 中最核心的一个。
+            - suggested_groups 是数组，元素必须尽量使用 knowledge 里已有的 group_name。
+            - confidence 只能是 高、中、低。
+            - need_manual_review 只能是 是、否。
+            - 不要输出 reason，不要输出 理由，不要输出长文本解释。
+            - 如果很确定，confidence=高 且 need_manual_review=否。
+            - 如果有一定依据但不够确定，confidence=中 且 need_manual_review=是。
+            - 如果信息不足或多个候选组都像，confidence=低 且 need_manual_review=是。
+        - id: 1820000000003-user
+          role: user
+          text: |
+            hosts:
+            {{#1820000000002.hosts_json#}}
+
+            knowledge:
+            {{#1820000000002.knowledge_json#}}
+        selected: false
+        title: recommend_hostgroups
+        type: llm
+        vision:
+          enabled: false
+      height: 98
+      id: '1820000000003'
+      position: {x: 680, y: 280}
+      positionAbsolute: {x: 680, y: 280}
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        code: |
+          import csv
+          import io
+          import json
+          import re
+
+          FIELDS = [
+              "ip", "name", "primary_group", "suggested_groups",
+              "confidence", "need_manual_review",
+          ]
+          CONFIDENCE_VALUES = {"高", "中", "低"}
+          REVIEW_VALUES = {"是", "否"}
+
+
+          def clean(value):
+              return "" if value is None else str(value).strip()
+
+
+          def load_json(text, default):
+              text = clean(text)
+              if not text:
+                  return default
+              text = re.sub(r"^```(?:json)?\s*", "", text)
+              text = re.sub(r"\s*```$", "", text)
+              try:
+                  return json.loads(text)
+              except Exception:
+                  return default
+
+
+          def parse_groups(value):
+              if isinstance(value, list):
+                  raw = value
+              else:
+                  raw = re.split(r"[;；,，]", clean(value))
+              groups = []
+              for item in raw:
+                  item = clean(item)
+                  if item and item not in groups:
+                      groups.append(item)
+              return groups
+
+
+          def write_csv(rows):
+              output = io.StringIO(newline="")
+              writer = csv.DictWriter(output, fieldnames=FIELDS, extrasaction="ignore")
+              writer.writeheader()
+              writer.writerows(rows)
+              return output.getvalue()
+
+
+          def main(hosts_json: str, llm_text: str) -> dict:
+              hosts = load_json(hosts_json, [])
+              llm_rows = load_json(llm_text, [])
+              rows_by_ip = {}
+              if isinstance(llm_rows, list):
+                  for item in llm_rows:
+                      if isinstance(item, dict):
+                          ip = clean(item.get("ip"))
+                          if ip:
+                              rows_by_ip[ip] = item
+
+              output_rows = []
+              for host in hosts if isinstance(hosts, list) else []:
+                  if not isinstance(host, dict):
+                      continue
+                  ip = clean(host.get("ip"))
+                  name = clean(host.get("name"))
+                  item = rows_by_ip.get(ip, {})
+                  groups = parse_groups(item.get("suggested_groups"))
+                  primary = clean(item.get("primary_group"))
+                  if primary and primary not in groups:
+                      groups.insert(0, primary)
+                  if not primary and groups:
+                      primary = groups[0]
+                  confidence = clean(item.get("confidence"))
+                  if confidence not in CONFIDENCE_VALUES:
+                      confidence = "低"
+                  review = clean(item.get("need_manual_review"))
+                  if review not in REVIEW_VALUES:
+                      review = "是"
+                  if confidence == "低":
+                      review = "是"
+                  output_rows.append({
+                      "ip": ip,
+                      "name": name,
+                      "primary_group": primary,
+                      "suggested_groups": ";".join(groups),
+                      "confidence": confidence,
+                      "need_manual_review": review,
+                  })
+
+              return {"recommended_hostgroups_csv": write_csv(output_rows)}
+        code_language: python3
+        desc: 校验 LLM 输出并整理为固定字段 CSV，不保留理由
+        outputs:
+          recommended_hostgroups_csv: {children: null, type: string}
+        selected: false
+        title: build_recommend_csv
+        type: code
+        variables:
+        - value_selector: ['1820000000002', hosts_json]
+          variable: hosts_json
+        - value_selector: ['1820000000003', text]
+          variable: llm_text
+      height: 98
+      id: '1820000000004'
+      position: {x: 980, y: 280}
+      positionAbsolute: {x: 980, y: 280}
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        outputs:
+        - {value_selector: ['1820000000004', recommended_hostgroups_csv], value_type: string, variable: recommended_hostgroups_csv}
+        - {value_selector: ['1820000000002', run_summary], value_type: string, variable: run_summary}
+        selected: false
+        title: Output
+        type: end
+      height: 116
+      id: '1820000000005'
+      position: {x: 1280, y: 280}
+      positionAbsolute: {x: 1280, y: 280}
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    viewport:
+      x: 80
+      y: 80
+      zoom: 0.8
+  rag_pipeline_variables: []
